@@ -8,6 +8,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
+from torchvision.models import resnet50, efficientnet_b3, densenet121
 from tqdm import tqdm
 import random
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve
@@ -22,15 +23,23 @@ def set_seed(seed=1234):
 
 set_seed()
 
-train_dir = "/workspace/"
-val_dir = "/workspace/"
-test_dir = "/workspace/"
+# データディレクトリのパスを設定（実際のパスに合わせて変更してください）
+base_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(base_dir, "BreastCancer")
+train_dir = os.path.join(data_dir, "train")
+val_dir = os.path.join(data_dir, "valid")
+test_dir = os.path.join(data_dir, "test")
 
 classes = ["0", "1"]
 
 train_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
+    transforms.Resize((256, 256)),
+    transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225])
@@ -83,50 +92,96 @@ num_workers = 0
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-class CNNModel(nn.Module):
-    def __init__(self):
-        super(CNNModel, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=100, kernel_size=3, padding=1)
-        self.relu1 = nn.ReLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv2 = nn.Conv2d(in_channels=100, out_channels=100, kernel_size=3, padding=1)
-        self.relu2 = nn.ReLU()
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv3 = nn.Conv2d(in_channels=100, out_channels=64, kernel_size=3, padding=1)
-        self.relu3 = nn.ReLU()
-        self.conv4 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1)
-        self.relu4 = nn.ReLU()
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.fc1 = nn.Linear(64 * 28 * 28, 64)
-        self.relu5 = nn.ReLU()
-        self.dropout1 = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(64, 32)
-        self.relu6 = nn.ReLU()
-        self.dropout2 = nn.Dropout(0.3)
-        self.fc3 = nn.Linear(32, 32)
-        self.relu7 = nn.ReLU()
-        self.out = nn.Linear(12, 1)
-        self.sigmoid = nn.Sigmoid()
+# Focal Lossの実装（クラス不均衡に対応）
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
+    def forward(self, inputs, targets):
+        bce_loss = nn.functional.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# 転移学習ベースのモデル（ResNet50を使用）
+class BreastCancerModel(nn.Module):
+    def __init__(self, model_name='resnet50', pretrained=True):
+        super(BreastCancerModel, self).__init__()
+        self.model_name = model_name
+        
+        if model_name == 'resnet50':
+            backbone = resnet50(pretrained=pretrained)
+            # 最後の全結合層を削除
+            self.features = nn.Sequential(*list(backbone.children())[:-1])
+            num_features = backbone.fc.in_features
+        elif model_name == 'efficientnet_b3':
+            backbone = efficientnet_b3(pretrained=pretrained)
+            self.features = backbone.features
+            num_features = backbone.classifier[1].in_features
+        elif model_name == 'densenet121':
+            backbone = densenet121(pretrained=pretrained)
+            self.features = backbone.features
+            num_features = backbone.classifier.in_features
+        else:
+            raise ValueError(f"Unknown model name: {model_name}")
+        
+        # カスタム分類ヘッド
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.2),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+        
     def forward(self, x):
-        x = self.pool1(self.relu1(self.conv1(x)))
-        x = self.pool2(self.relu2(self.conv2(x)))
-        x = self.relu3(self.conv3(x))
-        x = self.pool3(self.relu4(self.conv4(x)))
-        x = x.view(x.size(0), -1)
-        x = self.dropout1(self.relu5(self.fc1(x)))
-        x = self.dropout2(self.relu6(self.fc2(x)))
-        x = self.relu7(self.fc3(x))
-        x = self.sigmoid(self.out(x))
+        if self.model_name == 'resnet50':
+            x = self.features(x)
+            x = x.view(x.size(0), -1)
+        elif self.model_name == 'efficientnet_b3':
+            x = self.features(x)
+            x = nn.functional.adaptive_avg_pool2d(x, (1, 1))
+            x = x.view(x.size(0), -1)
+        elif self.model_name == 'densenet121':
+            x = self.features(x)
+            x = nn.functional.relu(x, inplace=True)
+            x = nn.functional.adaptive_avg_pool2d(x, (1, 1))
+            x = x.view(x.size(0), -1)
+        
+        x = self.classifier(x)
         return x
 
-model = CNNModel()
+# 転移学習モデルの作成（ResNet50を使用、EfficientNetやDenseNetにも変更可能）
+model = BreastCancerModel(model_name='resnet50', pretrained=True)
 print(model)
 
-criterion = nn.BCELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+# Focal Lossを使用（クラス不均衡に対応、通常のBCELossに戻す場合は nn.BCELoss() を使用）
+criterion = FocalLoss(alpha=1, gamma=2)
 
-num_epochs = 15 #元1
+# 学習率を調整（転移学習では初期は小さめに）
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+
+# 学習率スケジューラーを追加
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=3, verbose=True
+)
+
+num_epochs = 20  # エポック数を増やす（転移学習ではより多くのエポックが有効）
 train_losses, val_losses = [], []
 train_accuracies, val_accuracies = [], []
 
@@ -171,9 +226,13 @@ for epoch in epoch_bar:
     val_epoch_acc = val_correct / val_total
     val_losses.append(val_epoch_loss)
     val_accuracies.append(val_epoch_acc)
+    
+    # 学習率スケジューラーを更新
+    scheduler.step(val_epoch_loss)
+    
     epoch_bar.set_postfix(loss=epoch_loss, train_acc=epoch_acc, val_loss=val_epoch_loss, val_acc=val_epoch_acc)
 
-output_dir = "/workspace/"
+output_dir = os.path.join(base_dir, "output")
 os.makedirs(output_dir, exist_ok=True)
 weight_dir = os.path.join(output_dir, 'Weight')
 os.makedirs(weight_dir, exist_ok=True)
@@ -200,19 +259,44 @@ with torch.no_grad():
 
 y_true = np.array(all_labels).flatten()
 y_pred = np.array(all_preds).flatten()
+y_probs = np.array(all_probs).flatten()
 
-cm = confusion_matrix(y_true, y_pred)
-acc = accuracy_score(y_true, y_pred)
-auc = roc_auc_score(y_true, y_pred)
+# 閾値の最適化（ROC曲線から最適な閾値を決定）
+fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+optimal_idx = np.argmax(tpr - fpr)  # Youden's J統計量を使用
+optimal_threshold = thresholds[optimal_idx]
 
-TN, FP, FN, TP = cm.ravel()
-sensitivity = TP / (TP + FN)
-specificity = TN / (TN + FP)
+print(f"\n=== 閾値の最適化結果 ===")
+print(f"デフォルト閾値 (0.5) での評価:")
+cm_default = confusion_matrix(y_true, y_pred)
+acc_default = accuracy_score(y_true, y_pred)
+TN_default, FP_default, FN_default, TP_default = cm_default.ravel()
+sensitivity_default = TP_default / (TP_default + FN_default) if (TP_default + FN_default) > 0 else 0
+specificity_default = TN_default / (TN_default + FP_default) if (TN_default + FP_default) > 0 else 0
 
-print("Accuracy:", acc)
-print("AUC:", auc)
-print("Sensitivity (Recall):", sensitivity)
-print("Specificity:", specificity)
+print(f"  Accuracy: {acc_default:.4f}")
+print(f"  Sensitivity (Recall): {sensitivity_default:.4f}")
+print(f"  Specificity: {specificity_default:.4f}")
+
+# 最適な閾値での評価
+y_pred_optimal = (y_probs >= optimal_threshold).astype(int)
+cm_optimal = confusion_matrix(y_true, y_pred_optimal)
+acc_optimal = accuracy_score(y_true, y_pred_optimal)
+TN_optimal, FP_optimal, FN_optimal, TP_optimal = cm_optimal.ravel()
+sensitivity_optimal = TP_optimal / (TP_optimal + FN_optimal) if (TP_optimal + FN_optimal) > 0 else 0
+specificity_optimal = TN_optimal / (TN_optimal + FP_optimal) if (TN_optimal + FP_optimal) > 0 else 0
+
+print(f"\n最適閾値 ({optimal_threshold:.4f}) での評価:")
+print(f"  Accuracy: {acc_optimal:.4f}")
+print(f"  Sensitivity (Recall): {sensitivity_optimal:.4f}")
+print(f"  Specificity: {specificity_optimal:.4f}")
+
+# AUCの計算
+auc = roc_auc_score(y_true, y_probs)
+print(f"\nAUC: {auc:.4f}")
+
+# 最適な閾値を保存（テストデータの予測で使用）
+print(f"\n最適な閾値 {optimal_threshold:.4f} を使用してテストデータを予測します。")
 
 class TestDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -244,7 +328,8 @@ with torch.no_grad():
     for images, filenames in tqdm(test_loader, desc="Test Prediction"):
         images = images.to(device)
         outputs = model(images)
-        preds = (outputs.squeeze() >= 0.5).float().cpu().numpy().astype(int)
+        # 最適な閾値を使用（検証データで決定した閾値）
+        preds = (outputs.squeeze().cpu().numpy() >= optimal_threshold).astype(int)
         for fn, p in zip(filenames, preds):
             image_id = os.path.splitext(fn)[0]
             predictions.append((image_id, p))
