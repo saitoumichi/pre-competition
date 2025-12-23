@@ -18,11 +18,17 @@ from torch.utils.tensorboard import SummaryWriter
 # 乱数固定
 def set_seed(seed=1234):
     np.random.seed(seed)
+# → NumPyの乱数（前処理でNumPy使う場合など）
     random.seed(seed)
+# → Python標準 random の乱数（データ作成などで使う場合）
     torch.manual_seed(seed)
+# → PyTorch（CPU側）の乱数（初期化、Dropout、DataLoaderの一部など）
     torch.cuda.manual_seed(seed)
+# → PyTorch（GPU側）の乱数
     torch.backends.cudnn.deterministic = True
+# → cuDNN（GPUの高速ライブラリ）に対して 「毎回同じアルゴリズム寄り」 にする（速度が少し落ちることあり）
     os.environ['PYTHONHASHSEED'] = str(seed)
+# → Pythonのハッシュのランダム性を固定（集合/setや辞書/dictの順序などの再現性に関係）
 
 set_seed()
 
