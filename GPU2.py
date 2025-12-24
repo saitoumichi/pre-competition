@@ -18,6 +18,8 @@ from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 from torch.utils.tensorboard import SummaryWriter
 import timm
 import cv2
+import socket
+import torch.multiprocessing as mp
 
 
 # ===========================
@@ -35,25 +37,45 @@ def set_seed(seed=1234, rank=0):
 
 
 # ===========================
-# DDP 初期化（Windows対応版）
+# DDP 初期化（torchrun でも python 直実行でも動く版）
 # ===========================
-def ddp_setup():
-    if "RANK" not in os.environ:
-        raise RuntimeError("❌ このスクリプトは torchrun --nproc_per_node=2 専用です")
 
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+def ddp_setup(rank=None, local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=29500):
+    """DDP init.
 
-    if world_size != 2:
-        raise RuntimeError(f"❌ WORLD_SIZE={world_size} です。必ず2プロセスで起動してください")
+    - torchrun で起動した場合: 環境変数(RANK/LOCAL_RANK/WORLD_SIZE等)をそのまま使う
+    - python 直実行(spawn)の場合: rank/local_rank/world_size/master_* を引数で受け取り env:// で初期化する
+    """
+
+    # torchrun 起動パス
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        world_size = int(os.environ["WORLD_SIZE"])
+
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
+        backend = "gloo" if os.name == "nt" else "nccl"
+        dist.init_process_group(backend=backend, init_method="env://")
+        return rank, local_rank, world_size
+
+    # python 直実行(spawn)パス
+    if rank is None or local_rank is None or world_size is None:
+        raise RuntimeError("ddp_setup: python直実行の場合は rank/local_rank/world_size を渡してください")
+
+    os.environ.setdefault("MASTER_ADDR", str(master_addr))
+    os.environ.setdefault("MASTER_PORT", str(master_port))
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(local_rank)
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
     backend = "gloo" if os.name == "nt" else "nccl"
     dist.init_process_group(backend=backend, init_method="env://")
-    return rank, local_rank, world_size
+    return int(rank), int(local_rank), int(world_size)
 
 
 def is_main_process(rank: int) -> bool:
@@ -206,6 +228,7 @@ class TestDataset(Dataset):
 # ===========================
 # all_gather（可変長1次元tensorを集める）
 # ===========================
+
 def all_gather_1d_float_tensor(t: torch.Tensor) -> torch.Tensor:
     world_size = dist.get_world_size()
     device = t.device
@@ -231,9 +254,76 @@ def all_gather_1d_float_tensor(t: torch.Tensor) -> torch.Tensor:
         return torch.empty((0,), device=device, dtype=t.dtype)
     return torch.cat(out, dim=0)
 
+# ===========================
+# python直実行(spawn)用：空いているポートを探す
+# ===========================
 
-def main():
-    rank, local_rank, world_size = ddp_setup()
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+# ===========================
+# threshold最適化（valでbest thresholdを探す）
+# ===========================
+
+def find_best_threshold(y_true: np.ndarray, y_prob: np.ndarray, metric: str = "f1"):
+    """y_true: {0,1} 1D array, y_prob: [0,1] 1D array
+    Returns: (best_threshold, best_score)
+    """
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_t, best_score = 0.5, -1.0
+
+    # 念のため型整形
+    y_true = y_true.astype(np.int64)
+    y_prob = y_prob.astype(np.float32)
+
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(np.int64)
+
+        TP = np.sum((y_true == 1) & (y_pred == 1))
+        FP = np.sum((y_true == 0) & (y_pred == 1))
+        FN = np.sum((y_true == 1) & (y_pred == 0))
+        TN = np.sum((y_true == 0) & (y_pred == 0))
+
+        if metric == "f1":
+            prec = TP / (TP + FP) if (TP + FP) else 0.0
+            rec = TP / (TP + FN) if (TP + FN) else 0.0
+            score = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+        elif metric == "youden":
+            tpr = TP / (TP + FN) if (TP + FN) else 0.0
+            fpr = FP / (FP + TN) if (FP + TN) else 0.0
+            score = tpr - fpr
+        elif metric == "balanced_acc":
+            tpr = TP / (TP + FN) if (TP + FN) else 0.0
+            tnr = TN / (TN + FP) if (TN + FP) else 0.0
+            score = 0.5 * (tpr + tnr)
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+
+        if score > best_score:
+            best_score = score
+            best_t = float(t)
+
+    return best_t, float(best_score)
+
+
+def main(local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=None):
+    # torchrun なら env から、python直実行(spawn)なら引数から DDP を初期化
+    if local_rank is None:
+        rank, local_rank, world_size = ddp_setup()
+    else:
+        if master_port is None:
+            raise RuntimeError("spawn起動時は master_port が必要です")
+        rank = int(local_rank)  # 単一ノード想定なので rank=local_rank
+        rank, local_rank, world_size = ddp_setup(
+            rank=rank,
+            local_rank=int(local_rank),
+            world_size=int(world_size),
+            master_addr=master_addr,
+            master_port=int(master_port),
+        )
+
     set_seed(1234, rank=rank)
 
     device = torch.device(f"cuda:{local_rank}")
@@ -324,7 +414,10 @@ def main():
     val_loader   = DataLoader(val_dataset, batch_size=8, sampler=val_sampler, num_workers=0, pin_memory=True)
 
     model = timm.create_model("tf_efficientnet_b4_ns", pretrained=True, num_classes=1).to(device) #convnext_base.fb_in22k_ft_in1k_384
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
+    if torch.cuda.is_available():
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
+    else:
+        model = DDP(model)
 
     pos_weight_value = 1.4160455940377028
     pos_weight = torch.tensor([pos_weight_value], device=device)
@@ -333,6 +426,10 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
 
     num_epochs = 15
+    # ===========================
+    # ★追加：valで動的に最適化して更新していく閾値（初期値）
+    # ===========================
+    threshold = 0.4
 
     if writer is not None:  #convnext_base.fb_in22k_ft_in1k_384
         writer.add_text("config", f"""
@@ -342,7 +439,7 @@ lr=1e-4
 weight_decay=1e-4
 epochs={num_epochs}
 pos_weight={pos_weight_value}
-threshold=0.4
+threshold=dynamic (init=0.4)
 log_dir={log_dir}
 world_size={world_size}
 roi=yolox_nano_breast_roi_416 (416)
@@ -376,7 +473,7 @@ roi=yolox_nano_breast_roi_416 (416)
                 writer.add_scalar("Train/BatchLoss", loss.item(), global_step)
             global_step += 1
 
-            preds = (torch.sigmoid(outputs) >= 0.4).float()
+            preds = (torch.sigmoid(outputs) >= threshold).float()
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
@@ -413,7 +510,7 @@ roi=yolox_nano_breast_roi_416 (416)
                 val_loss += loss.item() * inputs.size(0)
 
                 probs = torch.sigmoid(outputs)
-                preds = (probs >= 0.4).float()
+                preds = (probs >= threshold).float()
                 val_correct += (preds == labels).sum().item()
                 val_total += labels.size(0)
 
@@ -437,12 +534,28 @@ roi=yolox_nano_breast_roi_416 (416)
         gathered_probs = all_gather_1d_float_tensor(local_probs_t)
         gathered_labels = all_gather_1d_float_tensor(local_labels_t)
 
+        # -------------------------------
+        # ★追加：valの確率から best threshold を探索し、全rankへ共有
+        # -------------------------------
+        best_t = threshold
+        best_score = float("nan")
+
         if is_main_process(rank):
             y_prob = gathered_probs.detach().cpu().numpy()
             y_true = gathered_labels.detach().cpu().numpy()
-            y_pred = (y_prob >= 0.4).astype(np.int64)
 
-            acc = accuracy_score(y_true, y_pred)
+            # 例：F1最大の閾値を探す（必要なら youden / balanced_acc に変更）
+            best_t, best_score = find_best_threshold(y_true, y_prob, metric="f1")
+
+        t_tensor = torch.tensor([best_t], device=device, dtype=torch.float32)
+        dist.broadcast(t_tensor, src=0)
+        threshold = float(t_tensor.item())
+
+        if is_main_process(rank):
+            # best threshold を使ってval指標を再計算
+            y_pred = (y_prob >= threshold).astype(np.int64)
+
+            acc_opt = accuracy_score(y_true, y_pred)
             auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
             cm = confusion_matrix(y_true, y_pred)
 
@@ -455,21 +568,24 @@ roi=yolox_nano_breast_roi_416 (416)
 
             print(f"Epoch {epoch+1}/{num_epochs} | "
                   f"train_loss={epoch_loss:.6f} train_acc={epoch_acc:.6f} | "
-                  f"val_loss={val_epoch_loss:.6f} val_acc={val_epoch_acc:.6f} | "
+                  f"val_loss={val_epoch_loss:.6f} val_acc(opt)={acc_opt:.6f} | "
+                  f"thr={threshold:.2f} thr_score={best_score:.4f} | "
                   f"AUC={auc} Sens={sensitivity} Spec={specificity}")
 
             if writer is not None:
                 writer.add_scalars("Loss", {"train": epoch_loss, "val": val_epoch_loss}, epoch)
-                writer.add_scalars("Accuracy", {"train": epoch_acc, "val": val_epoch_acc}, epoch)
+                writer.add_scalars("Accuracy", {"train": epoch_acc, "val_opt": acc_opt}, epoch)
                 writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
                 writer.add_scalar("Val/AUC", auc if auc == auc else 0.0, epoch)
                 writer.add_scalar("Val/Sensitivity", sensitivity if sensitivity == sensitivity else 0.0, epoch)
                 writer.add_scalar("Val/Specificity", specificity if specificity == specificity else 0.0, epoch)
+                writer.add_scalar("Val/BestThreshold", threshold, epoch)
+                writer.add_scalar("Val/BestThresholdScore", best_score if best_score == best_score else 0.0, epoch)
 
                 if cm.size == 4:
                     fig = plt.figure()
                     plt.imshow(cm, interpolation="nearest")
-                    plt.title("Confusion Matrix (val)")
+                    plt.title("Confusion Matrix (val) @ best threshold")
                     plt.colorbar()
                     tick_marks = np.arange(2)
                     plt.xticks(tick_marks, ["0", "1"])
@@ -521,7 +637,7 @@ roi=yolox_nano_breast_roi_416 (416)
             images = images.to(device, non_blocking=True)
             outputs = model(images).view(-1)
             probs = torch.sigmoid(outputs)
-            preds = (probs >= 0.4).to(torch.int64).detach().cpu().numpy().tolist()
+            preds = (probs >= threshold).to(torch.int64).detach().cpu().numpy().tolist()
 
             for fn, p in zip(filenames, preds):
                 image_id = os.path.splitext(fn)[0]
@@ -552,4 +668,15 @@ roi=yolox_nano_breast_roi_416 (416)
 
 
 if __name__ == "__main__":
-    main()
+    # torchrun で起動されている場合はそのまま
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        main()
+    else:
+        # python 直実行なら 2 プロセス spawn して 2GPU/2プロセス学習
+        ws = 2
+        if torch.cuda.is_available():
+            n_gpu = torch.cuda.device_count()
+            if n_gpu < 2:
+                raise RuntimeError(f"2GPU想定ですが GPUが{n_gpu}個しかありません")
+        port = find_free_port()
+        mp.spawn(main, args=(ws, "127.0.0.1", port), nprocs=ws, join=True)
