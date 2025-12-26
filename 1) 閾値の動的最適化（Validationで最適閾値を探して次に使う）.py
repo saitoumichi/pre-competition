@@ -20,7 +20,7 @@ import timm
 import cv2
 import socket
 import torch.multiprocessing as mp
-
+import hashlib
 
 # ===========================
 # 乱数固定（rankを混ぜる版）
@@ -56,7 +56,15 @@ def ddp_setup(rank=None, local_rank=None, world_size=None, master_addr="127.0.0.
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
 
-        backend = "gloo" if os.name == "nt" else "nccl"
+        # Windows環境で、環境変数のMASTER_ADDRが不正（例: kubernetes.docker.internal）になっていると
+        # c10dが接続先として使ってしまい警告が出ることがある。
+        # 単一ノード学習の想定では 127.0.0.1 に矯正して問題ない。
+        if os.name == "nt":
+            master_addr = os.environ.get("MASTER_ADDR", "")
+            if "kubernetes.docker.internal" in master_addr or master_addr.strip() == "":
+                os.environ["MASTER_ADDR"] = "127.0.0.1"
+
+        backend = "nccl" if torch.cuda.is_available() and os.name != "nt" else "gloo"
         dist.init_process_group(backend=backend, init_method="env://")
         return rank, local_rank, world_size
 
@@ -64,8 +72,8 @@ def ddp_setup(rank=None, local_rank=None, world_size=None, master_addr="127.0.0.
     if rank is None or local_rank is None or world_size is None:
         raise RuntimeError("ddp_setup: python直実行の場合は rank/local_rank/world_size を渡してください")
 
-    os.environ.setdefault("MASTER_ADDR", str(master_addr))
-    os.environ.setdefault("MASTER_PORT", str(master_port))
+    os.environ["MASTER_ADDR"] = str(master_addr)
+    os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(local_rank)
@@ -73,7 +81,7 @@ def ddp_setup(rank=None, local_rank=None, world_size=None, master_addr="127.0.0.
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
-    backend = "gloo" if os.name == "nt" else "nccl"
+    backend = "nccl" if torch.cuda.is_available() and os.name != "nt" else "gloo"
     dist.init_process_group(backend=backend, init_method="env://")
     return int(rank), int(local_rank), int(world_size)
 
@@ -145,14 +153,93 @@ def make_yolox_roi_cropper(yolox_model, postprocess_fn, test_size=(416, 416), co
 
 
 # ===========================
+# ROI crop cache (disk) + Lazy YOLOX loader
+# ===========================
+
+def _roi_cache_key(path: str) -> str:
+    """Cache key based on absolute path + mtime (so cache invalidates if file changes)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = 0
+    s = f"{os.path.abspath(path)}::{mtime}".encode("utf-8", errors="ignore")
+    return hashlib.sha1(s).hexdigest()
+
+
+class LazyYOLOXCropper:
+    """Load YOLOX only when a cache miss happens (significantly reduces startup time on cached runs)."""
+
+    def __init__(
+        self,
+        yolox_root: str,
+        exp_file: str,
+        ckpt_file: str,
+        device: torch.device,
+        test_size=(416, 416),
+        conf: float = 0.3,
+        nms: float = 0.65,
+        pad_ratio: float = 0.05,
+    ):
+        self.yolox_root = yolox_root
+        self.exp_file = exp_file
+        self.ckpt_file = ckpt_file
+        self.device = device
+        self.test_size = test_size
+        self.conf = conf
+        self.nms = nms
+        self.pad_ratio = pad_ratio
+
+        self._cropper = None
+
+    def _ensure_loaded(self):
+        if self._cropper is not None:
+            return
+
+        # YOLOX を importできるようにパス追加
+        if self.yolox_root not in sys.path:
+            sys.path.insert(0, self.yolox_root)
+
+        from yolox.exp import get_exp
+        from yolox.utils import postprocess
+
+        yexp = get_exp(self.exp_file, None)
+        yexp.test_conf = self.conf
+        yexp.nmsthre = self.nms
+        yexp.test_size = self.test_size
+
+        yolox_model = yexp.get_model().to(self.device)
+        yolox_model.eval()
+
+        ckpt = torch.load(self.ckpt_file, map_location=self.device)
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        yolox_model.load_state_dict(state, strict=False)
+
+        self._cropper = make_yolox_roi_cropper(
+            yolox_model=yolox_model,
+            postprocess_fn=postprocess,
+            test_size=self.test_size,
+            conf=self.conf,
+            nms=self.nms,
+            pad_ratio=self.pad_ratio,
+        )
+
+    def __call__(self, pil_img: Image.Image) -> Image.Image:
+        self._ensure_loaded()
+        return self._cropper(pil_img)
+
+
+# ===========================
 # Dataset クラス（YOLOX ROI対応）
 # ===========================
 class BreastCancerDataset(Dataset):
-    def __init__(self, root_dir, classes, transform=None, roi_detector=None):
+    def __init__(self, root_dir, classes, transform=None, roi_detector=None, roi_cache_dir=None):
         self.root_dir = root_dir
         self.classes = classes
         self.transform = transform
         self.roi_detector = roi_detector
+        self.roi_cache_dir = roi_cache_dir
+        if self.roi_cache_dir is not None:
+            os.makedirs(self.roi_cache_dir, exist_ok=True)
         self.data = []
         self._prepare_data()
 
@@ -181,13 +268,38 @@ class BreastCancerDataset(Dataset):
         except Exception:
             image = Image.new("RGB", (224, 224))
 
-        # ★追加：YOLOXでROI crop
-        if self.roi_detector is not None:
-            try:
-                image = self.roi_detector(image)
-            except Exception:
-                # 検出が壊れても学習を止めない（元画像で継続）
-                pass
+        # ★追加：YOLOXでROI crop（disk cache対応）
+        if self.roi_cache_dir is not None:
+            cache_key = _roi_cache_key(img_path)
+            cache_path = os.path.join(self.roi_cache_dir, f"{cache_key}.jpg")
+            if os.path.exists(cache_path):
+                try:
+                    image = Image.open(cache_path).convert("RGB")
+                except Exception:
+                    pass
+            elif self.roi_detector is not None:
+                try:
+                    image = self.roi_detector(image)
+                    tmp_path = cache_path + f".{os.getpid()}.tmp"
+                    try:
+                        image.save(tmp_path, format="JPEG", quality=95)
+                        os.replace(tmp_path, cache_path)
+                    except Exception:
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    # 検出が壊れても学習を止めない（元画像で継続）
+                    pass
+        else:
+            # cache無しの通常版
+            if self.roi_detector is not None:
+                try:
+                    image = self.roi_detector(image)
+                except Exception:
+                    pass
 
         if self.transform:
             image = self.transform(image)
@@ -195,10 +307,13 @@ class BreastCancerDataset(Dataset):
 
 
 class TestDataset(Dataset):
-    def __init__(self, root_dir, transform=None, roi_detector=None):
+    def __init__(self, root_dir, transform=None, roi_detector=None, roi_cache_dir=None):
         self.root_dir = root_dir
         self.transform = transform
         self.roi_detector = roi_detector
+        self.roi_cache_dir = roi_cache_dir
+        if self.roi_cache_dir is not None:
+            os.makedirs(self.roi_cache_dir, exist_ok=True)
         self.image_files = [
             f for f in sorted(os.listdir(self.root_dir))
             if os.path.isfile(os.path.join(self.root_dir, f)) and
@@ -213,12 +328,36 @@ class TestDataset(Dataset):
         path = os.path.join(self.root_dir, fn)
         image = Image.open(path).convert('RGB')
 
-        # ★追加：YOLOXでROI crop
-        if self.roi_detector is not None:
-            try:
-                image = self.roi_detector(image)
-            except Exception:
-                pass
+        # ★追加：YOLOXでROI crop（disk cache対応）
+        if self.roi_cache_dir is not None:
+            cache_key = _roi_cache_key(path)
+            cache_path = os.path.join(self.roi_cache_dir, f"{cache_key}.jpg")
+            if os.path.exists(cache_path):
+                try:
+                    image = Image.open(cache_path).convert("RGB")
+                except Exception:
+                    pass
+            elif self.roi_detector is not None:
+                try:
+                    image = self.roi_detector(image)
+                    tmp_path = cache_path + f".{os.getpid()}.tmp"
+                    try:
+                        image.save(tmp_path, format="JPEG", quality=95)
+                        os.replace(tmp_path, cache_path)
+                    except Exception:
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        else:
+            if self.roi_detector is not None:
+                try:
+                    image = self.roi_detector(image)
+                except Exception:
+                    pass
 
         if self.transform:
             image = self.transform(image)
@@ -267,44 +406,108 @@ def find_free_port() -> int:
 # threshold最適化（valでbest thresholdを探す）
 # ===========================
 
-def find_best_threshold(y_true: np.ndarray, y_prob: np.ndarray, metric: str = "f1"):
+def find_best_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    metric: str = "acc_then_f1",
+    prev_threshold: float = 0.5,
+    tie_break: str = "closest_to_prev",
+):
     """y_true: {0,1} 1D array, y_prob: [0,1] 1D array
     Returns: (best_threshold, best_score)
+
+    metric:
+      - "acc_then_f1": まずAccuracy最大、その同点の中でF1最大、さらに同点なら tie_break に従う
+      - "acc": Accuracy最大（同点は tie_break に従う）
+      - "f1": F1最大
+      - "youden": Youden index最大
+      - "balanced_acc": Balanced accuracy最大
     """
     thresholds = np.linspace(0.01, 0.99, 99)
-    best_t, best_score = 0.5, -1.0
 
     # 念のため型整形
     y_true = y_true.astype(np.int64)
     y_prob = y_prob.astype(np.float32)
 
+    best_t = float(prev_threshold) if tie_break == "closest_to_prev" else 0.5
+
+    def _tie_dist(tval: float) -> float:
+        if tie_break == "closest_to_prev":
+            return abs(float(tval) - float(prev_threshold))
+        # default: closest_to_0.5
+        return abs(float(tval) - 0.5)
+
+    # 二段指標用（acc->f1）
+    best_acc = -1.0
+    best_f1 = -1.0
+
+    # 単一指標用
+    best_score = -1.0
+
     for t in thresholds:
         y_pred = (y_prob >= t).astype(np.int64)
 
-        TP = np.sum((y_true == 1) & (y_pred == 1))
-        FP = np.sum((y_true == 0) & (y_pred == 1))
-        FN = np.sum((y_true == 1) & (y_pred == 0))
-        TN = np.sum((y_true == 0) & (y_pred == 0))
+        if metric == "acc_then_f1":
+            acc = float((y_pred == y_true).mean())
 
-        if metric == "f1":
+            TP = np.sum((y_true == 1) & (y_pred == 1))
+            FP = np.sum((y_true == 0) & (y_pred == 1))
+            FN = np.sum((y_true == 1) & (y_pred == 0))
+
             prec = TP / (TP + FP) if (TP + FP) else 0.0
             rec = TP / (TP + FN) if (TP + FN) else 0.0
-            score = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
-        elif metric == "youden":
-            tpr = TP / (TP + FN) if (TP + FN) else 0.0
-            fpr = FP / (FP + TN) if (FP + TN) else 0.0
-            score = tpr - fpr
-        elif metric == "balanced_acc":
-            tpr = TP / (TP + FN) if (TP + FN) else 0.0
-            tnr = TN / (TN + FP) if (TN + FP) else 0.0
-            score = 0.5 * (tpr + tnr)
+            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+
+            # 1) Accuracy 最大
+            # 2) Accuracy 同点なら F1 最大
+            # 3) さらに同点なら tie_break に従う（例: prev_thresholdに近い）
+            if (acc > best_acc) or \
+               (acc == best_acc and f1 > best_f1) or \
+               (acc == best_acc and f1 == best_f1 and _tie_dist(t) < _tie_dist(best_t)):
+                best_acc = acc
+                best_f1 = float(f1)
+                best_t = float(t)
+
         else:
-            raise ValueError(f"Unknown metric: {metric}")
+            if metric == "acc":
+                score = float((y_pred == y_true).mean())
+            elif metric == "f1":
+                TP = np.sum((y_true == 1) & (y_pred == 1))
+                FP = np.sum((y_true == 0) & (y_pred == 1))
+                FN = np.sum((y_true == 1) & (y_pred == 0))
 
-        if score > best_score:
-            best_score = score
-            best_t = float(t)
+                prec = TP / (TP + FP) if (TP + FP) else 0.0
+                rec = TP / (TP + FN) if (TP + FN) else 0.0
+                score = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+            elif metric == "youden":
+                TP = np.sum((y_true == 1) & (y_pred == 1))
+                FP = np.sum((y_true == 0) & (y_pred == 1))
+                FN = np.sum((y_true == 1) & (y_pred == 0))
+                TN = np.sum((y_true == 0) & (y_pred == 0))
 
+                tpr = TP / (TP + FN) if (TP + FN) else 0.0
+                fpr = FP / (FP + TN) if (FP + TN) else 0.0
+                score = tpr - fpr
+            elif metric == "balanced_acc":
+                TP = np.sum((y_true == 1) & (y_pred == 1))
+                FP = np.sum((y_true == 0) & (y_pred == 1))
+                FN = np.sum((y_true == 1) & (y_pred == 0))
+                TN = np.sum((y_true == 0) & (y_pred == 0))
+
+                tpr = TP / (TP + FN) if (TP + FN) else 0.0
+                tnr = TN / (TN + FP) if (TN + FP) else 0.0
+                score = 0.5 * (tpr + tnr)
+            else:
+                raise ValueError(f"Unknown metric: {metric}")
+
+            # 同点なら tie_break に従う
+            if (score > best_score) or (score == best_score and _tie_dist(t) < _tie_dist(best_t)):
+                best_score = float(score)
+                best_t = float(t)
+
+    if metric == "acc_then_f1":
+        # best_score には primary の Accuracy を返す（ログ用/整合性）
+        return best_t, float(best_acc)
     return best_t, float(best_score)
 
 
@@ -335,37 +538,52 @@ def main(local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=
     log_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\result_kazma\log_GPU2"
     writer = SummaryWriter(log_dir=log_dir) if is_main_process(rank) else None
 
+    output_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\result_michi\GPU2"
+
     classes = ["0", "1"]
 
     # ===========================
-    # ★追加：YOLOX を importできるようにパス追加 → モデルロード → ROI cropper作成
+    # ★追加：重み保存先（bestもここに保存）
+    # ===========================
+    weight_dir = os.path.join(output_dir, "Weight")
+    if is_main_process(rank):
+        os.makedirs(weight_dir, exist_ok=True)
+    dist.barrier()
+
+    def save_ckpt(name: str, epoch_i: int, thr: float, metrics: dict):
+        ckpt = {
+            "epoch": int(epoch_i),
+            "threshold": float(thr),
+            "metrics": {k: float(v) for k, v in metrics.items()},
+            "state_dict": model.module.state_dict(),
+        }
+        torch.save(ckpt, os.path.join(weight_dir, f"best_{name}.pth"))
+
+    best = {
+        "acc": (-1.0, -1),
+        "loss": (1e18, -1),
+        "auc": (-1.0, -1),
+    }
+
+    # ===========================
+    # ★変更：YOLOXは「必要になった時だけ」ロード（cache miss時）
+    # さらにROI crop結果をディスクへキャッシュして、次回以降の起動/学習を高速化
     # ===========================
     yolox_root = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer\YOLOX"
-    if yolox_root not in sys.path:
-        sys.path.insert(0, yolox_root)
-
-    # YOLOX import（sys.path追加後に行う）
-    from yolox.exp import get_exp
-    from yolox.utils import postprocess
 
     exp_file = os.path.join(yolox_root, r"exps\custom\yolox_nano_breast_roi_416.py")
     ckpt_file = os.path.join(yolox_root, r"YOLOX_outputs\yolox_base\latest_ckpt.pth")
 
-    yexp = get_exp(exp_file, None)
-    yexp.test_conf = 0.3
-    yexp.nmsthre = 0.65
-    yexp.test_size = (416, 416)
+    roi_cache_dir = os.path.join(output_dir, "roi_cache_yolox416_pad005")
+    if is_main_process(rank):
+        os.makedirs(roi_cache_dir, exist_ok=True)
+    dist.barrier()
 
-    yolox_model = yexp.get_model().to(device)
-    yolox_model.eval()
-
-    ckpt = torch.load(ckpt_file, map_location=device)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    yolox_model.load_state_dict(state, strict=False)
-
-    roi_cropper = make_yolox_roi_cropper(
-        yolox_model=yolox_model,
-        postprocess_fn=postprocess,
+    roi_cropper = LazyYOLOXCropper(
+        yolox_root=yolox_root,
+        exp_file=exp_file,
+        ckpt_file=ckpt_file,
+        device=device,
         test_size=(416, 416),
         conf=0.3,
         nms=0.65,
@@ -403,9 +621,9 @@ def main(local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=
         )
     ])
 
-    # ★変更：roi_detector=roi_cropper を渡す
-    train_dataset = BreastCancerDataset(train_dir, classes, train_transforms, roi_detector=roi_cropper)
-    val_dataset   = BreastCancerDataset(val_dir, classes, val_test_transforms, roi_detector=roi_cropper)
+    # ★変更：roi_detector=roi_cropper, roi_cache_dir=roi_cache_dir を渡す
+    train_dataset = BreastCancerDataset(train_dir, classes, train_transforms, roi_detector=roi_cropper, roi_cache_dir=roi_cache_dir)
+    val_dataset   = BreastCancerDataset(val_dir, classes, val_test_transforms, roi_detector=roi_cropper, roi_cache_dir=roi_cache_dir)
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
     val_sampler   = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
@@ -413,7 +631,7 @@ def main(local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=
     train_loader = DataLoader(train_dataset, batch_size=8, sampler=train_sampler, num_workers=0, pin_memory=True)
     val_loader   = DataLoader(val_dataset, batch_size=8, sampler=val_sampler, num_workers=0, pin_memory=True)
 
-    model = timm.create_model("tf_efficientnet_b4_ns", pretrained=True, num_classes=1).to(device) #convnext_base.fb_in22k_ft_in1k_384
+    model = timm.create_model("tf_efficientnet_b4.ns_jft_in1k", pretrained=True, num_classes=1).to(device) #convnext_base.fb_in22k_ft_in1k_384
     if torch.cuda.is_available():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
     else:
@@ -424,16 +642,21 @@ def main(local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
-    num_epochs = 15
+    num_epochs = 11
     # ===========================
     # ★追加：valで動的に最適化して更新していく閾値（初期値）
     # ===========================
     threshold = 0.4
 
+    # ===========================
+    # ★追加：bestモデル保存（rank0のみ）
+    # ===========================
+
     if writer is not None:  #convnext_base.fb_in22k_ft_in1k_384
         writer.add_text("config", f"""
-model=tf_efficientnet_b4_ns
+model=tf_efficientnet_b4.ns_jft_in1k
 batch_size=8
 lr=1e-4
 weight_decay=1e-4
@@ -537,6 +760,7 @@ roi=yolox_nano_breast_roi_416 (416)
         # -------------------------------
         # ★追加：valの確率から best threshold を探索し、全rankへ共有
         # -------------------------------
+        prev_threshold = float(threshold)
         best_t = threshold
         best_score = float("nan")
 
@@ -544,8 +768,14 @@ roi=yolox_nano_breast_roi_416 (416)
             y_prob = gathered_probs.detach().cpu().numpy()
             y_true = gathered_labels.detach().cpu().numpy()
 
-            # 例：F1最大の閾値を探す（必要なら youden / balanced_acc に変更）
-            best_t, best_score = find_best_threshold(y_true, y_prob, metric="f1")
+            # コンペの評価指標が Accuracy なので、val上のAccuracyが最大になる閾値を探す
+            best_t, best_score = find_best_threshold(
+                y_true,
+                y_prob,
+                metric="acc_then_f1",
+                prev_threshold=prev_threshold,
+                tie_break="closest_to_prev",
+            )
 
         t_tensor = torch.tensor([best_t], device=device, dtype=torch.float32)
         dist.broadcast(t_tensor, src=0)
@@ -556,8 +786,48 @@ roi=yolox_nano_breast_roi_416 (416)
             y_pred = (y_prob >= threshold).astype(np.int64)
 
             acc_opt = accuracy_score(y_true, y_pred)
+            pred_pos_rate = float((y_pred == 1).mean())
+            true_pos_rate = float((y_true == 1).mean())
+
+            TP = np.sum((y_true == 1) & (y_pred == 1))
+            FP = np.sum((y_true == 0) & (y_pred == 1))
+            FN = np.sum((y_true == 1) & (y_pred == 0))
+            prec = TP / (TP + FP) if (TP + FP) else 0.0
+            rec = TP / (TP + FN) if (TP + FN) else 0.0
+            f1_opt = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+
             auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
             cm = confusion_matrix(y_true, y_pred)
+
+            metrics_now = {
+                "acc": float(acc_opt),
+                "f1": float(f1_opt),
+                "loss": float(val_epoch_loss),
+                "auc": float(auc) if auc == auc else float("nan"),
+                "thr": float(threshold),
+                "pred_pos_rate": float(pred_pos_rate),
+                "true_pos_rate": float(true_pos_rate),
+                # find_best_threshold(metric="acc_then_f1") は best_score=best_acc を返す
+                "thr_primary": float(best_score) if best_score == best_score else float("nan"),
+            }
+
+            # best acc
+            if acc_opt > best["acc"][0]:
+                best["acc"] = (float(acc_opt), epoch + 1)
+                save_ckpt("acc", epoch + 1, threshold, metrics_now)
+                print(f"[BEST-ACC] epoch={epoch+1} acc={acc_opt:.6f} -> saved best_acc.pth")
+
+            # best loss (min)
+            if val_epoch_loss < best["loss"][0]:
+                best["loss"] = (float(val_epoch_loss), epoch + 1)
+                save_ckpt("loss", epoch + 1, threshold, metrics_now)
+                print(f"[BEST-LOSS] epoch={epoch+1} loss={val_epoch_loss:.6f} -> saved best_loss.pth")
+
+            # best auc
+            if auc == auc and auc > best["auc"][0]:
+                best["auc"] = (float(auc), epoch + 1)
+                save_ckpt("auc", epoch + 1, threshold, metrics_now)
+                print(f"[BEST-AUC] epoch={epoch+1} auc={auc:.6f} -> saved best_auc.pth")
 
             if cm.size == 4:
                 TN, FP, FN, TP = cm.ravel()
@@ -568,19 +838,23 @@ roi=yolox_nano_breast_roi_416 (416)
 
             print(f"Epoch {epoch+1}/{num_epochs} | "
                   f"train_loss={epoch_loss:.6f} train_acc={epoch_acc:.6f} | "
-                  f"val_loss={val_epoch_loss:.6f} val_acc(opt)={acc_opt:.6f} | "
+                  f"val_loss={val_epoch_loss:.6f} val_acc(opt)={acc_opt:.6f} val_f1(opt)={f1_opt:.4f} | "
                   f"thr={threshold:.2f} thr_score={best_score:.4f} | "
+                  f"pred_pos_rate={pred_pos_rate:.3f} true_pos_rate={true_pos_rate:.3f} | "
                   f"AUC={auc} Sens={sensitivity} Spec={specificity}")
 
             if writer is not None:
                 writer.add_scalars("Loss", {"train": epoch_loss, "val": val_epoch_loss}, epoch)
                 writer.add_scalars("Accuracy", {"train": epoch_acc, "val_opt": acc_opt}, epoch)
+                writer.add_scalar("Val/F1_opt", f1_opt, epoch)
                 writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
                 writer.add_scalar("Val/AUC", auc if auc == auc else 0.0, epoch)
                 writer.add_scalar("Val/Sensitivity", sensitivity if sensitivity == sensitivity else 0.0, epoch)
                 writer.add_scalar("Val/Specificity", specificity if specificity == specificity else 0.0, epoch)
                 writer.add_scalar("Val/BestThreshold", threshold, epoch)
                 writer.add_scalar("Val/BestThresholdScore", best_score if best_score == best_score else 0.0, epoch)
+                writer.add_scalar("Val/PredPosRate", pred_pos_rate, epoch)
+                writer.add_scalar("Val/TruePosRate", true_pos_rate, epoch)
 
                 if cm.size == 4:
                     fig = plt.figure()
@@ -598,6 +872,11 @@ roi=yolox_nano_breast_roi_416 (416)
                     writer.add_figure("Val/ConfusionMatrix", fig, epoch)
                     plt.close(fig)
 
+        # スケジューラのログとステップ（バリデーション後、dist.barrier()の前）
+        if writer is not None and is_main_process(rank):
+            writer.add_scalar("LR/Scheduler", scheduler.get_last_lr()[0], epoch)
+        scheduler.step()
+
         dist.barrier()
 
     if writer is not None:
@@ -606,8 +885,6 @@ roi=yolox_nano_breast_roi_416 (416)
     # ===========================
     # 重み保存（rank0のみ）
     # ===========================
-    output_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\result_kazma\GPU2"
-    weight_dir = os.path.join(output_dir, "Weight")
 
     dist.barrier()
     if is_main_process(rank):
@@ -623,10 +900,19 @@ roi=yolox_nano_breast_roi_416 (416)
     dist.barrier()
     torch.cuda.empty_cache()
 
-    # ★変更：roi_detector=roi_cropper を渡す
-    test_dataset = TestDataset(test_dir, val_test_transforms, roi_detector=roi_cropper)
+    # ★変更：roi_detector=roi_cropper, roi_cache_dir=roi_cache_dir を渡す
+    test_dataset = TestDataset(test_dir, val_test_transforms, roi_detector=roi_cropper, roi_cache_dir=roi_cache_dir)
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     test_loader = DataLoader(test_dataset, batch_size=8, sampler=test_sampler, num_workers=0, pin_memory=True)
+
+    # --- use best checkpoint for Kaggle Accuracy ---
+    dist.barrier()
+    best_path = os.path.join(weight_dir, "best_acc.pth")
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=device)
+        model.module.load_state_dict(ckpt["state_dict"], strict=True)
+        threshold = float(ckpt.get("threshold", threshold))
+    dist.barrier()
 
     model.eval()
     local_pairs = []
@@ -658,7 +944,7 @@ roi=yolox_nano_breast_roi_416 (416)
         prediction_dir = os.path.join(output_dir, "Prediction")
         os.makedirs(prediction_dir, exist_ok=True)
 
-        submit_file_path = os.path.join(prediction_dir, "sample_submit_kazma_1223_GPU2_roi3.csv")
+        submit_file_path = os.path.join(prediction_dir, "sample_submit_best_acc.csv")
         df = pd.DataFrame(all_pairs, columns=["image_id", "target"])
         df.to_csv(submit_file_path, index=False)
         print(f"サブミットファイルが {submit_file_path} に作成されました。")
