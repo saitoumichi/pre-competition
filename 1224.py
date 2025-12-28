@@ -569,20 +569,33 @@ def main(local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=
     # ConvNeXt: tiny/small を切り替え（まずは tiny 推奨：軽くて過学習しにくい）
     # 例: "convnext_tiny.fb_in22k_ft_in1k_384" or "convnext_small.fb_in22k_ft_in1k_384"
     MODEL_NAME = "convnext_tiny.fb_in22k_ft_in1k_384"
-    IMG_SIZE = 384            # input resolution (224 / 384 / 512 etc.)
-    VAL_RESIZE = 448          # resize before centercrop on val/test
 
-    BATCH_SIZE = 8
+    # 640x640 学習/推論設定
+    IMG_SIZE = 640            # input resolution
+    VAL_RESIZE = 704          # Resize -> CenterCrop(640) 用（少し大きめ）
+
+    # 640はメモリを食うので小さめで
+    BATCH_SIZE = 2
     NUM_WORKERS = 0           # Windowsで不安定なら0のまま。余裕があれば 2〜4。
 
-    NUM_EPOCHS = 25           # 11だとConvNeXtは伸び切らないことが多い
-    LR = 5e-5                 # 1e-4より少し低め推奨
+    # 学習するなら 0 ではなく >0 にする（推論だけなら 0 のままでOK）
+    NUM_EPOCHS = 25
+
+    # 高解像度は不安定になりやすいので少し控えめに
+    LR = 3e-5
     WEIGHT_DECAY = 0.05       # AdamWの定番
+
+    # 実効バッチを稼ぐ（BATCH_SIZE=2 でも 2*4=8 相当）
+    ACCUM_STEPS = 4
+
+    # AMP (mixed precision) で速度/メモリ改善
+    USE_AMP = torch.cuda.is_available()
 
     # augmentation strength
     ROT_DEG = 10
-    RRC_SCALE = (0.80, 1.00)
-    RRC_RATIO = (0.90, 1.10)
+    # 640は情報量が多いので、強い切り取りで病変が消えやすい → 少し弱める
+    RRC_SCALE = (0.90, 1.00)
+    RRC_RATIO = (0.95, 1.05)
 
     # early stopping (val_acc(opt) 기준)
     EARLY_STOPPING = True
@@ -700,7 +713,9 @@ def main(local_rank=None, world_size=None, master_addr="127.0.0.1", master_port=
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=LR * 0.1)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, NUM_EPOCHS), eta_min=LR * 0.1)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
 
     num_epochs = NUM_EPOCHS
     # early stopping state (rank0 only)
@@ -745,14 +760,23 @@ roi=yolox_nano_breast_roi_416 (416)
             inputs = inputs.to(device, non_blocking=True)
             labels = labels.float().to(device, non_blocking=True).view(-1, 1)
 
-            optimizer.zero_grad(set_to_none=True)
+            # gradient accumulation
+            if (global_step % ACCUM_STEPS) == 0:
+                optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(inputs).view(-1, 1)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                outputs = model(inputs).view(-1, 1)
+                loss = criterion(outputs, labels)
+                loss = loss / ACCUM_STEPS
 
-            running_loss += loss.item() * inputs.size(0)
+            scaler.scale(loss).backward()
+
+            if ((global_step + 1) % ACCUM_STEPS) == 0:
+                scaler.step(optimizer)
+                scaler.update()
+
+            # loss は /ACCUM_STEPS 済みなので、ログ用に元スケールへ戻す
+            running_loss += (loss.item() * ACCUM_STEPS) * inputs.size(0)
 
             if writer is not None:
                 writer.add_scalar("Train/BatchLoss", loss.item(), global_step)
@@ -790,8 +814,9 @@ roi=yolox_nano_breast_roi_416 (416)
                 inputs = inputs.to(device, non_blocking=True)
                 labels = labels.float().to(device, non_blocking=True).view(-1, 1)
 
-                outputs = model(inputs).view(-1, 1)
-                loss = criterion(outputs, labels)
+                with torch.cuda.amp.autocast(enabled=USE_AMP):
+                    outputs = model(inputs).view(-1, 1)
+                    loss = criterion(outputs, labels)
 
                 # --- debug: investigate abnormal val_loss spikes (rank0 only) ---
                 if is_main_process(rank):
@@ -1009,7 +1034,7 @@ roi=yolox_nano_breast_roi_416 (416)
     # まずは hflip のみON推奨（vflip/rot90はデータ次第で効いたり悪化したりするので任意）。
     TTA_HFLIP = True
     TTA_VFLIP = False
-    TTA_ROT90 = False  # 90度回転（ONにするなら 90/270 の平均を取る）
+    TTA_ROT90 = True  # 90度回転（ONにするなら 90/270 の平均を取る）
 
     # アンサンブル対象（存在するものだけ使う）
     ENSEMBLE_CKPTS = ["best_acc.pth", "best_auc.pth", "best_loss.pth"]
@@ -1027,29 +1052,35 @@ roi=yolox_nano_breast_roi_416 (416)
         probs_list = []
 
         # original
-        probs_list.append(torch.sigmoid(model_ddp(images).view(-1)))
+        with torch.cuda.amp.autocast(enabled=USE_AMP):
+            probs_list.append(torch.sigmoid(model_ddp(images).view(-1)))
 
         # hflip
         if TTA_HFLIP:
             images_h = torch.flip(images, dims=[3])  # NCHW の W 方向（左右反転）
-            probs_list.append(torch.sigmoid(model_ddp(images_h).view(-1)))
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                probs_list.append(torch.sigmoid(model_ddp(images_h).view(-1)))
 
         # vflip
         if TTA_VFLIP:
             images_v = torch.flip(images, dims=[2])  # NCHW の H 方向（上下反転）
-            probs_list.append(torch.sigmoid(model_ddp(images_v).view(-1)))
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                probs_list.append(torch.sigmoid(model_ddp(images_v).view(-1)))
 
         # hvflip
         if TTA_HFLIP and TTA_VFLIP:
             images_hv = torch.flip(images, dims=[2, 3])
-            probs_list.append(torch.sigmoid(model_ddp(images_hv).view(-1)))
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                probs_list.append(torch.sigmoid(model_ddp(images_hv).view(-1)))
 
         # rot90 / rot270
         if TTA_ROT90:
             images_r90 = torch.rot90(images, k=1, dims=[2, 3])
             images_r270 = torch.rot90(images, k=3, dims=[2, 3])
-            probs_list.append(torch.sigmoid(model_ddp(images_r90).view(-1)))
-            probs_list.append(torch.sigmoid(model_ddp(images_r270).view(-1)))
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                probs_list.append(torch.sigmoid(model_ddp(images_r90).view(-1)))
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                probs_list.append(torch.sigmoid(model_ddp(images_r270).view(-1)))
 
         probs = torch.stack(probs_list, dim=0).mean(dim=0)
         return probs
