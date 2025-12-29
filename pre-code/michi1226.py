@@ -41,22 +41,20 @@ class Config:
     accum_steps = 8       
     
     epochs = 30
-    lr = 2e-4
+    lr = 1e-4        # 2e-4 -> 1e-4 に下げて慎重に学習
     min_lr = 1e-6
     weight_decay = 1e-4
     max_grad_norm = 1.0 
     
-    # 【変更点】MixUp復活 (データが増えたので有効)
-    use_mixup = True      
-    mixup_p = 0.5         
-    mixup_alpha = 0.4     
-    cutmix_alpha = 1.0    
+    # 【変更点】MixUpはオフに戻す（確実に学習させるため）
+    use_mixup = False      
+    mixup_p = 0.0         
     
     # パス
     train_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer\train"
     val_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer\valid"
     test_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer\test"
-    output_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\result_final_phase6"
+    output_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\result_final_phase7"
 
 # ==========================================
 # Utils
@@ -77,55 +75,6 @@ def set_seed(seed=1234, rank=0):
 
 def is_main_process(rank):
     return rank == 0
-
-# ==========================================
-# MixUp / CutMix Functions
-# ==========================================
-def rand_bbox(size, lam):
-    W = size[2]
-    H = size[3]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
-
-def cutmix_data(x, y, alpha=1.0):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-    
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size).to(x.device)
-
-    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
-    x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
-    
-    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
-    y_a, y_b = y, y[index]
-    return x, y_a, y_b, lam
-
-def mixup_data(x, y, alpha=1.0):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-        
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size).to(x.device)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
 
 # ==========================================
 # GeM Pooling
@@ -230,7 +179,7 @@ def get_transforms():
     }
 
 # ==========================================
-# Validation Function (Accuracy探索)
+# Validation Function
 # ==========================================
 def validate(model, loader, criterion, device):
     model.eval()
@@ -255,28 +204,23 @@ def validate(model, loader, criterion, device):
             all_probs.append(probs)
             all_labels.append(labels)
             
-    # Gather all results
     all_probs = torch.cat(all_probs)
     all_labels = torch.cat(all_labels)
     
-    # 0除算回避
     dataset_len = len(loader.dataset)
     if dataset_len == 0:
         return 0.0, 0.0, 0.0, 0.5, [], []
 
     epoch_loss = running_loss / dataset_len
     
-    # CPUへ
     y_true = all_labels.cpu().numpy()
     y_prob = all_probs.cpu().numpy()
     
-    # AUC
     if len(np.unique(y_true)) > 1:
         val_auc = roc_auc_score(y_true, y_prob)
     else:
         val_auc = 0.0
         
-    # Accuracy Maximization (閾値探索)
     best_acc = 0.0
     best_thr = 0.5
     for thr in np.arange(0.01, 1.00, 0.01):
@@ -300,7 +244,6 @@ def main_worker(rank, world_size, master_port):
     torch.cuda.set_device(device)
     set_seed(Config.seed, rank)
     
-    # Dataset
     transforms_dict = get_transforms()
     train_dataset = BreastCancerDataset(Config.train_dir, classes=["0", "1"], transform=transforms_dict["train"])
     val_dataset = BreastCancerDataset(Config.val_dir, classes=["0", "1"], transform=transforms_dict["valid"])
@@ -311,23 +254,21 @@ def main_worker(rank, world_size, master_port):
     train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, sampler=train_sampler, num_workers=0, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=Config.batch_size, sampler=val_sampler, num_workers=0, pin_memory=True, drop_last=False)
     
-    # 重み計算
+    # 重み計算 & 強化 (Boost)
     if is_main_process(rank):
         all_labels = [item[1] for item in train_dataset.data]
         num_pos = sum(all_labels)
         num_neg = len(all_labels) - num_pos
-        weight_val = num_neg / max(num_pos, 1.0)
-        print(f"Data Stats -> Neg: {num_neg}, Pos: {num_pos}, Calculated Pos Weight: {weight_val:.4f}")
+        # 【重要】計算された重みをさらに1.5倍して、陽性を見逃さないように強制する
+        weight_val = (num_neg / max(num_pos, 1.0)) * 1.5 
+        print(f"Data Stats -> Neg: {num_neg}, Pos: {num_pos}, Boosted Pos Weight: {weight_val:.4f}")
     else:
-        # Rank 0以外も定義だけ必要（値は適当で良いが同期させるのがベスト）
         weight_val = 1.0 
     
-    # ブロードキャストで重みを統一
     weight_tensor = torch.tensor([weight_val], device=device)
     dist.broadcast(weight_tensor, src=0)
     pos_weight = weight_tensor
     
-    # Model
     model = BreastCancerModel(Config.model_name).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank], output_device=rank)
@@ -344,7 +285,6 @@ def main_worker(rank, world_size, master_port):
         final_div_factor=1000.0
     )
     
-    # 安定したBCEに戻す
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     scaler = torch.cuda.amp.GradScaler()
     
@@ -352,9 +292,8 @@ def main_worker(rank, world_size, master_port):
     final_best_thr = 0.5
     
     if is_main_process(rank):
-        print(f"Start Training: {Config.model_name} on {world_size} GPUs (Acc Optimization)")
+        print(f"Start Training: {Config.model_name} on {world_size} GPUs (Phase 7: No MixUp, Strong Weight)")
     
-    # --- Training Loop ---
     for epoch in range(Config.epochs):
         train_sampler.set_epoch(epoch)
         model.train()
@@ -372,23 +311,9 @@ def main_worker(rank, world_size, master_port):
         for i, (images, labels) in enumerate(pbar):
             images, labels = images.to(device), labels.to(device).view(-1, 1)
             
-            # --- MixUp / CutMix Logic ---
-            do_mix = False
-            if Config.use_mixup and np.random.random() < Config.mixup_p:
-                do_mix = True
-                if np.random.random() < 0.5:
-                    images, y_a, y_b, lam = mixup_data(images, labels, Config.mixup_alpha)
-                else:
-                    images, y_a, y_b, lam = cutmix_data(images, labels, Config.cutmix_alpha)
-            
             with torch.cuda.amp.autocast():
                 outputs = model(images)
-                
-                if do_mix:
-                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
-                else:
-                    loss = criterion(outputs, labels)
-                    
+                loss = criterion(outputs, labels)
                 loss = loss / Config.accum_steps
             
             if not torch.isfinite(loss):
@@ -401,7 +326,6 @@ def main_worker(rank, world_size, master_port):
             if (i + 1) % Config.accum_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
-                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -420,11 +344,8 @@ def main_worker(rank, world_size, master_port):
         else:
             avg_train_loss = 0.0
         
-        # Validation (各Rankで計算し、Rank 0 で集計して表示する簡易実装は関数内にあり)
-        # 正確なThreshold探索のため、Rank 0 にデータを集めて計算する実装にする
+        # Validation
         model.eval()
-        
-        # Rankごとに推論結果を収集
         local_preds = []
         local_labels = []
         with torch.no_grad():
@@ -443,7 +364,6 @@ def main_worker(rank, world_size, master_port):
             local_preds = torch.tensor([]).to(device)
             local_labels = torch.tensor([]).to(device)
 
-        # 全Rankの結果を集約
         gathered_preds = [torch.zeros_like(local_preds) for _ in range(world_size)]
         gathered_labels = [torch.zeros_like(local_labels) for _ in range(world_size)]
         dist.all_gather(gathered_preds, local_preds)
@@ -452,13 +372,11 @@ def main_worker(rank, world_size, master_port):
         if is_main_process(rank):
             all_preds = torch.cat(gathered_preds).cpu().numpy()
             all_labels = torch.cat(gathered_labels).cpu().numpy()
-            
             if np.isnan(all_preds).any(): all_preds = np.nan_to_num(all_preds, nan=0.5)
             
             # 閾値探索
             best_acc = 0.0
             best_thr = 0.5
-            # 全データで計算
             y_true = all_labels
             y_prob = all_preds
             
@@ -467,7 +385,6 @@ def main_worker(rank, world_size, master_port):
             else:
                 val_auc = 0.0
 
-            # 0.01刻みでBest Accを探す
             for thr in np.arange(0.01, 1.00, 0.01):
                 y_pred_tmp = (y_prob >= thr).astype(int)
                 acc_tmp = accuracy_score(y_true, y_pred_tmp)
@@ -477,20 +394,17 @@ def main_worker(rank, world_size, master_port):
             
             print(f"Epoch {epoch+1} | Loss: {avg_train_loss:.4f} | Val Acc: {best_acc:.4f} (Thr: {best_thr:.2f}) | AUC: {val_auc:.4f}")
             
-            # Accuracyが改善したら保存
             if best_acc > best_acc_score:
                 best_acc_score = best_acc
                 final_best_thr = best_thr
-                
                 if not os.path.exists(Config.output_dir):
                     os.makedirs(Config.output_dir)
                 torch.save(model.module.state_dict(), os.path.join(Config.output_dir, "best_model.pth"))
-                # 閾値を保存
                 with open(os.path.join(Config.output_dir, "best_threshold.txt"), "w") as f:
                     f.write(str(final_best_thr))
                 print(f"  >>> Best Accuracy Updated! Saved Model & Thr: {final_best_thr:.2f}")
 
-    # --- Inference with TTA ---
+    # --- Inference ---
     dist.barrier()
     if is_main_process(rank):
         print(f"\nStarting Inference on Rank 0 using Threshold: {final_best_thr:.4f}")
@@ -506,19 +420,14 @@ def main_worker(rank, world_size, master_port):
             for images, filenames in tqdm(test_loader, desc="Inference"):
                 images = images.to(device)
                 
-                # TTA
                 out1 = model_best(images)
                 out2 = model_best(torch.flip(images, dims=[3]))
-                
                 prob1 = torch.sigmoid(out1).cpu().numpy().flatten()
                 prob2 = torch.sigmoid(out2).cpu().numpy().flatten()
-                
                 prob1 = np.nan_to_num(prob1, nan=0.0)
                 prob2 = np.nan_to_num(prob2, nan=0.0)
-                
                 final_probs = (prob1 + prob2) / 2.0
                 
-                # 最適化された閾値で予測
                 preds = (final_probs >= final_best_thr).astype(int)
                 
                 for fn, p in zip(filenames, preds):
@@ -538,8 +447,6 @@ if __name__ == "__main__":
         world_size = torch.cuda.device_count()
     else:
         world_size = 1
-    
-    print(f"Using {world_size} GPUs")
     if world_size > 1:
         port = find_free_port()
         mp.spawn(main_worker, args=(world_size, port), nprocs=world_size, join=True)
