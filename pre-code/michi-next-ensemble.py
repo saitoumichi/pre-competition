@@ -1,61 +1,47 @@
 import pandas as pd
-import os
 
-# ==========================================
-# 設定
-# ==========================================
-folder_path = "./result_refined_multi_gpu"
-path_highres_folder = "./result_refined_multi_gpu_768"
+# ========================================================
+# ★これが「82%」を出した最強の3人組です
+# ========================================================
+# 1. エース（ConvNeXt）
+file_ace = 'my_best_78.csv'
+# 2. チームメイト（EfficientNet）
+file_team = 'team_member_77.csv'
+# 3. ★MVP★ 通常の30エポック版（これが一番相性が良かった！）
+# ※Mixup版(0.75)ではなく、こっち(0.60)を使います
+file_mvp = 'submit_effnet_b4_TTA_thr_0.60.csv'
+# ========================================================
 
-# 読み込み
-df_eff  = pd.read_csv(os.path.join(folder_path, "submission_eff.csv"))
-df_prob = pd.read_csv(os.path.join(path_highres_folder, "submission_highres_prob.csv"))
+print("ファイルを読み込んでいます...")
+try:
+    sub1 = pd.read_csv(file_ace)
+    sub2 = pd.read_csv(file_team)
+    sub3 = pd.read_csv(file_mvp)
+except FileNotFoundError:
+    print("★エラー：ファイルが見つかりません。")
+    print("「submit_effnet_b4_TTA_thr_0.60.csv」があるか確認してください！")
+    exit()
 
-# ==========================================
-# 1. 守備重視: 偽陽性を消す (High-Resの得意技)
-# ==========================================
-# EfficientNetが「1」でも、High-Resが「0.4以下」なら「0」にする
-# (統計では25枚くらい該当します)
-sub_fp = df_eff.copy()
-count_fp = 0
-for i in range(len(sub_fp)):
-    if sub_fp.loc[i, "target"] == 1 and df_prob.loc[i, "target"] < 0.40:
-        sub_fp.loc[i, "target"] = 0
-        count_fp += 1
+target_col = 'target' 
 
-name_fp = "submission_logic_FIX_FP.csv"
-sub_fp.to_csv(os.path.join(folder_path, name_fp), index=False)
-print(f"作成: {name_fp} -> {count_fp} 枚を「正常(0)」に修正しました")
+# お掃除
+for sub in [sub1, sub2, sub3]:
+    sub[target_col] = sub[target_col].astype(str).str.replace('[', '', regex=False).str.replace(']', '', regex=False).astype(int)
 
-# ==========================================
-# 2. 攻撃重視: 見逃しを拾う
-# ==========================================
-# EfficientNetが「0」でも、High-Resが「0.7以上」なら「1」にする
-# (統計では16枚くらい該当します)
-sub_fn = df_eff.copy()
-count_fn = 0
-for i in range(len(sub_fn)):
-    if sub_fn.loc[i, "target"] == 0 and df_prob.loc[i, "target"] > 0.70:
-        sub_fn.loc[i, "target"] = 1
-        count_fn += 1
+# 相関チェック（0.42前後なら成功）
+print(f"相関係数(エース vs MVP): {sub1[target_col].corr(sub3[target_col]):.4f}")
 
-name_fn = "submission_logic_FIX_FN.csv"
-sub_fn.to_csv(os.path.join(folder_path, name_fn), index=False)
-print(f"作成: {name_fn} -> {count_fn} 枚を「がん(1)」に修正しました")
+# シンプルな多数決（これが一番強かった！）
+total_vote = sub1[target_col] + sub2[target_col] + sub3[target_col]
+submission = sub1.copy()
+submission[target_col] = (total_vote >= 2).astype(int)
 
-# ==========================================
-# 3. ハイブリッド (両方やる)
-# ==========================================
-sub_mix = df_eff.copy()
-for i in range(len(sub_mix)):
-    # FP削除
-    if sub_mix.loc[i, "target"] == 1 and df_prob.loc[i, "target"] < 0.40:
-        sub_mix.loc[i, "target"] = 0
-    # FN救出
-    elif sub_mix.loc[i, "target"] == 0 and df_prob.loc[i, "target"] > 0.70:
-        sub_mix.loc[i, "target"] = 1
+# 誇り高きファイル名で保存
+output_name = 'submission_BEST_SCORE_82.csv'
+submission.to_csv(output_name, index=False)
 
-name_mix = "submission_logic_HYBRID.csv"
-sub_mix.to_csv(os.path.join(folder_path, name_mix), index=False)
-print(f"作成: {name_mix} -> 攻守両方を適用しました")
-print("="*50)
+print(f"--------------------------------------------------")
+print(f"最強ファイル復活完了！: {output_name}")
+print(f"いろいろ試しましたが、結局これがNo.1でした。")
+print(f"これを最終提出として送り出しましょう！")
+print(f"--------------------------------------------------")
