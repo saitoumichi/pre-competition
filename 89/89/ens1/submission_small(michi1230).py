@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import pandas as pd
 import random
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -59,6 +60,7 @@ def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -66,10 +68,8 @@ def get_transforms(cfg):
     train_transform = transforms.Compose([
         transforms.Resize((cfg.img_size, cfg.img_size)),
         transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
         transforms.RandomRotation(20),
         transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -121,48 +121,62 @@ class BreastCancerDataset(Dataset):
 # ==========================================
 # ★ Training Function (ここを修正しました！)
 # ==========================================
-def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, mixup_fn, device, ema_model=None, accum_iter=1):
+def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, mixup_fn, device, ema_model=None, accum_iter=1, start_update=0):
     model.train()
     running_loss = 0.0
-    optimizer.zero_grad() # 最初に勾配をリセット
-    
-    # enumerateを使ってステップ数をカウントできるように変更
+
+    # 最初に勾配をリセット
+    optimizer.zero_grad(set_to_none=True)
+
+    # timm CosineLRScheduler は「累積update回数」で更新する
+    update_step = start_update
+
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Train", leave=False)
-    
+
     for step, (images, labels) in pbar:
         images = images.to(device)
         labels = labels.to(device)
-        
+
         if mixup_fn is not None:
             images, labels = mixup_fn(images, labels)
-            
+
         with autocast(enabled=True):
             outputs = model(images)
+
+            # BCEWithLogitsLoss: ラベルは float を想定
             if len(labels.shape) == 1:
                 loss = criterion(outputs.view(-1), labels.float())
             else:
+                # Mixup後は (B, 2) などになるので、positiveクラス(1)を使う
                 loss = criterion(outputs.view(-1), labels[:, 1])
-            
-            # ★ 修正点1: 損失を蓄積数で割る（平均化）
+
+            # 勾配蓄積：平均化
             loss = loss / accum_iter
 
         scaler.scale(loss).backward()
-        
-        # ★ 修正点2: accum_iter回に1回だけ重みを更新する
-        if (step + 1) % accum_iter == 0:
+
+        # accum_iter回に1回、または最後のバッチで必ず更新する
+        do_update = ((step + 1) % accum_iter == 0) or ((step + 1) == len(loader))
+        if do_update:
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
-            
-            if ema_model:
-                ema_model.update(model)
-            
+            optimizer.zero_grad(set_to_none=True)
+
+            # EMA更新は DataParallel を考慮して module を渡す
+            if ema_model is not None:
+                ema_model.update(model.module if hasattr(model, "module") else model)
+
+            if scheduler is not None:
+                scheduler.step_update(update_step)
+            update_step += 1
+
         # ログ表示用に元のスケールに戻して加算
         running_loss += (loss.item() * accum_iter) * images.size(0)
-        pbar.set_postfix({'loss': loss.item() * accum_iter})
-        
-    scheduler.step_update(num_updates=len(loader))
-    return running_loss / len(loader.dataset)
+        pbar.set_postfix({'loss': float(loss.item() * accum_iter), 'updates': update_step})
+
+    epoch_loss = running_loss / len(loader.dataset)
+    return epoch_loss, update_step
+
 
 # ==========================================
 # Validation Function (変更なし)
@@ -267,25 +281,28 @@ def main():
 
     optimizer = optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
     
-    num_steps = int(CFG.epochs * len(train_loader))
+    # 勾配蓄積後の「実際のoptimizer update回数」をt_initialにする
+    updates_per_epoch = math.ceil(len(train_loader) / CFG.accum_iter)
+    num_steps = int(CFG.epochs * updates_per_epoch)
     scheduler = CosineLRScheduler(
-        optimizer, t_initial=num_steps, lr_min=1e-6, 
-        warmup_t=int(num_steps*0.1), warmup_lr_init=1e-6, cycle_limit=1
+        optimizer, t_initial=num_steps, lr_min=1e-6,
+        warmup_t=max(1, int(num_steps * 0.1)), warmup_lr_init=1e-6, cycle_limit=1
     )
     
     pos_weight = torch.tensor([2.0]).to(device) 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)    
     scaler = GradScaler()
 
-    best_acc = 0.0
+    best_auc = 0.0
+    update_step = 0
     
     for epoch in range(CFG.epochs):
         print(f"\nEpoch {epoch+1}/{CFG.epochs}")
         
-        # ★ 修正点3: accum_iter を渡す
-        train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler, scheduler, mixup_fn, device, ema_model, 
-            accum_iter=CFG.accum_iter
+        # ★ 修正点3: accum_iter, update_step を渡す
+        train_loss, update_step = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, scheduler, mixup_fn, device, ema_model,
+            accum_iter=CFG.accum_iter, start_update=update_step
         )
         
         # Validation
@@ -298,11 +315,11 @@ def main():
         print(f"Val  [Raw] Loss: {val_loss:.4f} Acc: {val_acc:.4f} AUC: {val_auc:.4f}")
         print(f"Val  [EMA] Loss: {ema_loss:.4f} Acc: {ema_acc:.4f} AUC: {ema_auc:.4f}")
         
-        if ema_auc > best_acc:
-            best_acc = ema_auc
+        if ema_auc > best_auc:
+            best_auc = ema_auc
             save_path = os.path.join(CFG.output_dir, "best_model.pth")
             torch.save(ema_model.module.state_dict(), save_path)
-            print(f"Best Model Saved! (AUC: {best_acc:.4f})")
+            print(f"Best Model Saved! (AUC: {best_auc:.4f})")
             
             cm = confusion_matrix(y_true, y_pred)
             print("Confusion Matrix:\n", cm)

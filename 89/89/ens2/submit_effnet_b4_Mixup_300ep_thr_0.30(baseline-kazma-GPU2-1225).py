@@ -28,7 +28,7 @@ def set_seed(seed=1234):
 set_seed()
 
 # パス設定
-train_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer\train"
+train_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer_300GBALL\train_640_breast"
 val_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer\valid"
 test_dir = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\nakayamaken\BreastCancer\test"
 
@@ -42,6 +42,24 @@ os.makedirs(weight_dir, exist_ok=True)
 prediction_dir = os.path.join(output_dir, "Prediction")
 os.makedirs(prediction_dir, exist_ok=True)
 
+# ==========================================
+# Resume / Checkpoint
+# ==========================================
+RESUME = True  # Trueにすると checkpoint があれば続きから回す
+CHECKPOINT_PATH = os.path.join(weight_dir, "checkpoint_last.pth")
+
+# 追加で回すエポック数（"300epやった結果の続き"として、ここで上乗せ分を決める）
+EXTRA_EPOCHS = 30
+
+# warm-start する元の重み（まずはここから追加学習を始める）
+# 1) 今回の weight_dir に既にある（前回の出力をここに置いた）場合はそれを使う
+# 2) 無ければ、別フォルダの既存重みを指定して使う
+BASE_WEIGHT_PATH = os.path.join(weight_dir, "effnet_b4_mixup_300ep_model.pth")
+FALLBACK_WEIGHT_PATH = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\result_kazma_effnet_b4_mixup\Weight\effnet_b4_mixup_300ep_model.pth"
+
+# 今回の追加学習の最終保存名（上書き事故を防ぐ）
+FINAL_WEIGHT_NAME = f"effnet_b4_mixup_noaug_extra{EXTRA_EPOCHS}ep.pth"
+
 writer = SummaryWriter(log_dir=log_dir)
 classes = ["0", "1"]
 
@@ -49,11 +67,12 @@ classes = ["0", "1"]
 # 2. 画像変換
 # ==========================================
 train_transforms = transforms.Compose([
-    transforms.Resize((400, 400)),
-    transforms.RandomCrop((380, 380)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(degrees=30),
-    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=5),
+        # 入力サイズは val/test と揃える（まずは安定させる）
+    transforms.Resize((380, 380)),
+
+    # マンモで比較的安全な拡張（必要最小限）
+    transforms.RandomHorizontalFlip(p=0.5),
+
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -123,6 +142,9 @@ class TestDataset(Dataset):
 # 4. DataLoader
 # ==========================================
 train_dataset = BreastCancerDataset(train_dir, classes, train_transforms)
+print("train_dir:", train_dir)
+print("len(train_dataset):", len(train_dataset))
+print("example files in 0:", os.listdir(os.path.join(train_dir, "0"))[:5])
 val_dataset = BreastCancerDataset(val_dir, classes, val_test_transforms)
 
 BATCH_SIZE = 16
@@ -136,15 +158,49 @@ print("Creating model: tf_efficientnet_b4_ns")
 model = timm.create_model("tf_efficientnet_b4_ns", pretrained=True, num_classes=1)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
-prev_weight_path = r"D:\puresotu\workespace\nakayama_ken-main\nakayama_ken-main\result_kazma_effnet_b4_mixup\Weight\effnet_b4_mixup_model.pth"
 
-if os.path.exists(prev_weight_path):
-    print(f"★強くてニューゲーム！前回の重みをロードします: {prev_weight_path}")
-    # 重みを上書きする
-    # ※ strict=False は万が一の細かいエラーを無視してロードするおまじない
-    model.load_state_dict(torch.load(prev_weight_path), strict=False)
-else:
-    print("★前回の重みが見つかりませんので、1から学習します。")
+start_epoch = 0
+_resume_ckpt = None  # checkpoint を読み込めたら dict が入る
+model_only_from_ckpt = False  # True のときは「モデル重みだけ」使って optimizer/scheduler は作り直す
+
+# 1) checkpoint があれば optimizer/scheduler も含めて復元（本当の意味での"続き"）
+if RESUME and os.path.exists(CHECKPOINT_PATH):
+    print(f"\n[RESUME] checkpoint をロード: {CHECKPOINT_PATH}")
+    ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu")
+
+    if isinstance(model, nn.DataParallel):
+        model.module.load_state_dict(ckpt["model"], strict=False)
+    else:
+        model.load_state_dict(ckpt["model"], strict=False)
+
+    # optimizer/scheduler は後で定義するので、ここでは ckpt を保持だけしておく
+    _resume_ckpt = ckpt
+
+    start_epoch = int(ckpt.get("epoch", 0))
+    print(f"[RESUME] start_epoch={start_epoch}")
+
+    # もし epoch が EXTRA_EPOCHS より大きいなら、これは「今回の追加学習用checkpoint」ではなく
+    # 以前の別ランの checkpoint の可能性が高い。optimizer/scheduler は引き継がず、モデル重みだけ使って追加学習する。
+    if start_epoch >= EXTRA_EPOCHS:
+        print(
+            f"[RESUME] checkpoint epoch ({start_epoch}) >= EXTRA_EPOCHS ({EXTRA_EPOCHS}). "
+            "This looks like a different run. Will warm-start from model weights only (reset optimizer/scheduler)."
+        )
+        model_only_from_ckpt = True
+        _resume_ckpt = None
+        start_epoch = 0
+
+ # 2) checkpoint が無い場合は、指定した重みから"追加学習"（モデルだけ復元）
+#    ※ model_only_from_ckpt=True のときは、すでに ckpt からモデル重みを読み込んでいるので再ロードしない
+if (_resume_ckpt is None) and (not model_only_from_ckpt):
+    if os.path.exists(BASE_WEIGHT_PATH):
+        print(f"\n[WARM-START] base weight をロード: {BASE_WEIGHT_PATH}")
+        model.load_state_dict(torch.load(BASE_WEIGHT_PATH, map_location="cpu"), strict=False)
+    elif os.path.exists(FALLBACK_WEIGHT_PATH):
+        print(f"\n[WARM-START] fallback weight をロード: {FALLBACK_WEIGHT_PATH}")
+        model.load_state_dict(torch.load(FALLBACK_WEIGHT_PATH, map_location="cpu"), strict=False)
+    else:
+        print("\n[WARM-START] base weight が見つからないので、ImageNet事前学習から開始します。")
 if torch.cuda.device_count() > 1:
     print(f"🔥 GPUを {torch.cuda.device_count()} 枚使ってフルパワー学習します！")
     model = nn.DataParallel(model)
@@ -155,17 +211,24 @@ if torch.cuda.device_count() > 1:
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
 
-# ★ここが300エポック用の最強設定
-num_epochs = 300
-# 学習率を徐々に下げて、最後に綺麗に着地させる（Cosine Annealing）
+# 既存の学習が300ep完走済みでも、このスクリプトでは「追加学習(EXTRA_EPOCHS)」として回す
+num_epochs = EXTRA_EPOCHS
+
+# 学習率は追加学習用に短めのCosineで回す
 scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+
+# checkpoint からの完全復帰（optimizer/scheduler をここで復元）
+if _resume_ckpt is not None:
+    optimizer.load_state_dict(_resume_ckpt["optimizer"])
+    scheduler.load_state_dict(_resume_ckpt["scheduler"])
+
 
 # ==========================================
 # 7. Training Loop
 # ==========================================
 alpha = 1.0 # Mixup強度
 
-epoch_bar = tqdm(range(num_epochs), desc="Training Progress")
+epoch_bar = tqdm(range(start_epoch, num_epochs), desc="Training Progress")
 
 for epoch in epoch_bar:
     # --- Train (Mixup) ---
@@ -200,6 +263,16 @@ for epoch in epoch_bar:
 
     # ★エポックの終わりに学習率を更新
     scheduler.step()
+
+    # --- checkpoint 保存（中断しても完全に続きから回せる） ---
+    ckpt_to_save = {
+        "epoch": epoch + 1,
+        "model": (model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+    }
+    torch.save(ckpt_to_save, CHECKPOINT_PATH)
+
 
     epoch_loss = running_loss / len(train_loader.dataset)
     epoch_acc = correct / total

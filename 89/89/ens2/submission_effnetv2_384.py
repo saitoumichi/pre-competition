@@ -34,7 +34,7 @@ class CFG:
     weight_decay = 1e-4
     
     # ★最新モデル: EfficientNetV2 Small
-    # in21k_ft_in1k: 2100万枚の画像で事前学習した「超・博識」な重みです
+    # in21k_ft_in1k: 2100万枚の画像で事前学習した「超・博識」な重み
     model_name = 'tf_efficientnetv2_s.in21k_ft_in1k'
     
     mixup_alpha = 0.8
